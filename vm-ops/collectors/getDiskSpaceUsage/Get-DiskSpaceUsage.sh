@@ -16,23 +16,33 @@
 #
 #         DriveLetter  -> the mount point (e.g. "/", "/data")
 #         DiskNumber   -> not applicable on Linux (left null)
-#         LUN          -> Azure LUN of the backing data disk (from the sysfs SCSI address)
+#         LUN          -> Azure LUN of the backing data disk (from Azure's udev links)
 #         Device       -> (extra) filesystem source, e.g. /dev/sda1 or /dev/mapper/rootvg-rootlv
 #         DiskDevice   -> (extra) underlying kernel disk(s), e.g. sda or sdc,sdd (LVM/md aware)
 #
-#     Azure disk correlation: each mount is resolved to its underlying whole disk(s) through
-#     /sys (partitions, LVM / device-mapper and md RAID are followed down to the real disks), the
-#     LUN is read from the disk's SCSI address on the Azure data-disk controller, and joined to
-#     the Azure Instance Metadata Service (IMDS, 169.254.169.254) disk list by LUN (data disks)
-#     or by the OS-disk flag (disks backing "/"). If a volume spans several disks (LVM stripe,
-#     md RAID) LUN/AzureDiskName/AzureDiskResourceId are comma-separated and AzureDiskSizeGB is
-#     the sum. If IMDS is unreachable or a lookup fails those columns are left null - the core
-#     SizeGB/UsedGB/FreeGB values are always collected independently.
+#     Azure disk correlation. Each mount is resolved to its underlying whole disk(s) through /sys
+#     (partitions, LVM / device-mapper and md RAID are followed down to the real disks). Each
+#     disk is then identified ONLY from evidence the platform provides; nothing is inferred:
 #
-#     Space values: SizeGB = filesystem size, UsedGB = blocks actually holding data (df "Used";
-#     reserved-for-root blocks are NOT counted, so this is what a backup would copy), FreeGB =
-#     space available to non-root users (df "Available"), PercentFree = FreeGB / SizeGB, as in
-#     the Windows script. On Linux UsedGB + FreeGB can be less than SizeGB by the reserved blocks.
+#         OS disk    /dev/disk/azure/root (SCSI) or /dev/disk/azure/os (NVMe). If neither link
+#                    exists, the disk backing "/" is used only when it is a single disk.
+#         Data disk  /dev/disk/azure/scsi1/lunN or /dev/disk/azure/data/by-lun/N -> LUN, joined
+#                    to the Azure Instance Metadata Service (IMDS, 169.254.169.254) disk list.
+#
+#     A disk that matches neither is left unmapped. Mapping is all-or-nothing per volume: if a
+#     volume spans several disks (LVM / md RAID) the Azure columns are filled only when EVERY
+#     disk is identified (LUN / AzureDiskName / AzureDiskResourceId comma-separated,
+#     AzureDiskSizeGB the sum); otherwise they stay null so a partial list is never mistaken for
+#     the whole volume. IsOsDisk is true / false only when that can be established, else null.
+#     The core SizeGB/UsedGB/FreeGB values are always collected independently of all of this.
+#
+#     Space values: SizeGB = filesystem size, UsedGB = blocks the filesystem reports as in use
+#     (df "Used"; reserved-for-root blocks are not counted), FreeGB = space available to
+#     non-root users (df "Available"), PercentFree = FreeGB / SizeGB, as in the Windows script.
+#     UsedGB is a filesystem-level figure and an ESTIMATE for sizing a backup, not an exact
+#     backup size: Azure Backup works on whole disks, so deleted-file blocks that were never
+#     discarded, unallocated LVM space, swap and raw partitions are not reflected. On Linux
+#     UsedGB + FreeGB can be less than SizeGB by the reserved blocks.
 #
 #     Uses only bash builtins plus tools present on every mainstream distribution (RHEL/CentOS/
 #     Rocky/Alma, Ubuntu/Debian, SLES, Oracle Linux): df, readlink, date, tr and curl (required;
@@ -61,8 +71,10 @@
 # .NOTES
 #     Needs bash 3.2+ and root (the Custom Script Extension runs as root). Outbound HTTPS to
 #     <account>.table.core.windows.net and, for disk correlation, link-local access to IMDS.
-#     LUN correlation covers SCSI-attached disks (the default for Azure VM families that use
-#     SCSI); NVMe-attached disks are reported but their Azure columns stay null.
+#     Azure disk mapping needs Azure's udev links under /dev/disk/azure (installed with the
+#     Azure Linux agent / azure-vm-utils). Without them LUN and the AzureDisk* columns are left
+#     null rather than guessed; space values are unaffected. NVMe data disks are mapped only
+#     when /dev/disk/azure/data/by-lun is present.
 
 # Re-exec under bash if launched by `sh script.sh` (dash etc.); everything below needs bash.
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -278,10 +290,15 @@ IMDS_ID=()
 IMDS_SIZE=()
 IMDS_OK=0
 
-# First string value of "key":"value" in $1.
+# First value of "key" in $1, whether JSON wrote it as a string ("lun":"1") or a number ("lun":1).
 json_first() {
-    local re="\"$2\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""
-    if [[ $1 =~ $re ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
+    local re_s="\"$2\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""
+    local re_n="\"$2\"[[:space:]]*:[[:space:]]*(-?[0-9]+)"
+    if [[ $1 =~ $re_s ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    elif [[ $1 =~ $re_n ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
 }
 
 # Managed-disk resource id (skips e.g. diskEncryptionSet ids that precede it).
@@ -325,8 +342,9 @@ get_azure_disk_inventory() {
     json=$(curl -sf --noproxy '*' --max-time 5 -H 'Metadata: true' "$url" 2>/dev/null) || return 1
     [ -n "$json" ] || return 1
 
-    json=${json//$'\n'/}
-    json=${json//$'\r'/}
+    # Drop all whitespace so the structure is independent of how IMDS pretty-prints it. The only
+    # values read below (names, ids, lun, sizes) never contain whitespace.
+    json=${json//[[:space:]]/}
 
     if os=$(json_object "$json" osDisk); then
         IMDS_OS_NAME=$(json_first "$os" name)
@@ -422,12 +440,19 @@ collect_disks() {
     fi
 }
 
-# Azure's own udev rules publish data disks as /dev/disk/azure/scsi1/lunN (SCSI) and
-# /dev/disk/azure/data/by-lun/N (SCSI + NVMe). Load them once as device -> LUN.
-AZ_LUN_DEV=()
-AZ_LUN_NUM=()
-ROOT_HOST=""
+# Disk identification, from Azure's own udev links only (published by the Azure Linux agent /
+# azure-vm-utils). Nothing is inferred from SCSI addresses or controller numbers: a disk with no
+# link is simply "unidentified".
+#
+#   OS disk        /dev/disk/azure/root (SCSI)   /dev/disk/azure/os (NVMe)
+#   Data disk      /dev/disk/azure/scsi1/lunN    /dev/disk/azure/data/by-lun/N
+#   Resource disk  /dev/disk/azure/resource      /dev/disk/azure/local/*  (not a managed disk)
+AZ_LUN_DEV=()      # data disks: /dev/<disk> paths ...
+AZ_LUN_NUM=()      # ... and their LUNs (parallel arrays)
+OS_DISK=""         # kernel name of THE OS disk, or empty when it cannot be established
+RES_DISKS=""       # space separated kernel names of resource / local disks
 
+# Data-disk links, loaded once as device -> LUN.
 load_azure_lun_links() {
     local l name target
     for l in /dev/disk/azure/scsi1/lun* /dev/disk/azure/data/by-lun/*; do
@@ -442,40 +467,59 @@ load_azure_lun_links() {
     done
 }
 
-# Azure LUN of a whole disk ($1), empty if it is not an Azure data disk. The OS and
-# temporary/resource disks are deliberately not given a LUN, so they cannot be mistaken
-# for data LUN 0.
-disk_lun() {
-    local d=$1 real k lun host
-    local re_hctl='/[0-9]+:[0-9]+:[0-9]+:([0-9]+)/block/'
-    local re_host='/host([0-9]+)/'
+# Resource / local disks, so a disk that is known not to be the OS disk can be told apart from
+# one that is simply unidentified.
+load_resource_disks() {
+    local l real n
+    for l in /dev/disk/azure/resource /dev/disk/azure/local/by-index/* /dev/disk/azure/local/by-name/*; do
+        [ -L "$l" ] || continue
+        real=$(readlink -f "$l" 2>/dev/null)
+        n=${real##*/}
+        [ -n "$n" ] || continue
+        DISK_LIST=""
+        collect_disks "$n"
+        for n in $DISK_LIST; do
+            case " $RES_DISKS " in *" $n "*) ;; *) RES_DISKS="${RES_DISKS:+$RES_DISKS }$n" ;; esac
+        done
+    done
+}
 
-    # 1. Authoritative: Azure udev links.
+# Establish THE OS disk (sets OS_DISK) or leave it empty. $1 = disks backing "/".
+detect_os_disk() {
+    local root_disks=$1 link real n
+
+    # 1. Azure's own OS-disk link; it must resolve to exactly one whole disk.
+    for link in /dev/disk/azure/root /dev/disk/azure/os; do
+        [ -e "$link" ] || continue
+        real=$(readlink -f "$link" 2>/dev/null)
+        n=${real##*/}
+        [ -n "$n" ] || continue
+        DISK_LIST=""
+        collect_disks "$n"
+        case $DISK_LIST in
+            "" | *" "*) ;;
+            *) OS_DISK=$DISK_LIST; return 0 ;;
+        esac
+    done
+
+    # 2. No Azure link: the disk under "/" counts only if it is a single disk. If "/" spans
+    #    several disks (e.g. a volume group extended onto a data disk) there is no way to say
+    #    which is the OS disk, so it stays unknown.
+    case $root_disks in
+        "" | *" "*) ;;
+        *) OS_DISK=$root_disks ;;
+    esac
+}
+
+# Azure LUN of a whole disk ($1) from the data-disk links, empty if there is none.
+disk_lun() {
+    local d=$1 k
     for ((k = 0; k < ${#AZ_LUN_DEV[@]}; k++)); do
         if [ "${AZ_LUN_DEV[k]}" = "/dev/$d" ]; then
             printf '%s' "${AZ_LUN_NUM[k]}"
             return 0
         fi
     done
-    # Links exist but this disk is not among them -> not a data disk.
-    [ ${#AZ_LUN_DEV[@]} -gt 0 ] && return 0
-
-    # 2. No udev links (rules not installed): infer from the SCSI address. Controller 0
-    #    (VMBus ...-0000-8899-...) carries the OS/temp disk; data disks sit on another host.
-    real=$(readlink -f "/sys/class/block/$d" 2>/dev/null)
-    case $real in
-        *-0000-8899-0000-000000000000/*) return 0 ;;
-    esac
-    [[ $real =~ $re_hctl ]] || return 0
-    lun=${BASH_REMATCH[1]}
-    [[ $real =~ $re_host ]] || return 0
-    host=${BASH_REMATCH[1]}
-    case $real in
-        *-0001-8899-0000-000000000000/*) printf '%s' "$lun" ;;
-        *)
-            if [ -n "$ROOT_HOST" ] && [ "$host" != "$ROOT_HOST" ]; then printf '%s' "$lun"; fi
-            ;;
-    esac
 }
 
 #endregion Disk resolution
@@ -501,7 +545,7 @@ ROOT_MM=""
 collect_snapshot() {
     local line F sep i j k mnt fstype src majmin rootpath dup
     local df_out df_line D size_kb used_kb avail_kb size_h free_h used_h pct_t
-    local label dev disk lun osflag
+    local label dev disk lun
     local -a LBL_DEV=() LBL_NAME=()
     local ROOT_DISKS=""
 
@@ -562,19 +606,16 @@ collect_snapshot() {
         V_MNT+=("$mnt"); V_ROOTFLAG+=("$rootpath"); V_SRC+=("$src"); V_MM+=("$majmin"); V_FS+=("$fstype")
     done < /proc/self/mountinfo
 
-    # Disk(s) backing "/" -> used for the IsOsDisk flag.
+    # Disk(s) backing "/" -> fallback evidence for the OS disk when Azure's link is missing.
     if [ -n "$ROOT_SRC" ] && resolve_block "$ROOT_SRC" "$ROOT_MM"; then
         DISK_LIST=""
         collect_disks "$R_NAME"
         ROOT_DISKS=$DISK_LIST
-
-        # SCSI host of the OS disk (only used by the sysfs fallback in disk_lun).
-        local root_disk=${ROOT_DISKS%% *} root_real re_host='/host([0-9]+)/'
-        root_real=$(readlink -f "/sys/class/block/$root_disk" 2>/dev/null)
-        if [[ $root_real =~ $re_host ]]; then ROOT_HOST=${BASH_REMATCH[1]}; fi
     fi
 
     load_azure_lun_links
+    load_resource_disks
+    detect_os_disk "$ROOT_DISKS"
 
     # Filesystem labels (by-label symlinks -> real device), read once.
     for label in /dev/disk/by-label/*; do
@@ -591,8 +632,9 @@ collect_snapshot() {
     for ((i = 0; i < ${#V_MNT[@]}; i++)); do
         mnt=${V_MNT[i]}
 
-        # Size / used / free via df (1K blocks, POSIX output). Used = blocks holding data (what
-        # a backup would copy; reserved-for-root blocks excluded), Free = available to non-root.
+        # Size / used / free via df (1K blocks, POSIX output). Used = blocks the filesystem
+        # reports in use (reserved-for-root blocks excluded; an estimate for backup sizing, not
+        # an exact backup size), Free = available to non-root.
         df_out=$($DF_PREFIX df -P -k -- "$mnt" 2>/dev/null)
         df_line=${df_out#*$'\n'}
         set -f
@@ -640,35 +682,70 @@ collect_snapshot() {
             collect_disks "$R_NAME"
             V_DISKDEV[i]=${DISK_LIST// /,}
 
-            local luns="" names="" ids="" size_sum=0 size_seen=0 is_os=""
-            [ -n "$ROOT_DISKS" ] && is_os=false
+            # Identify every disk under the volume from platform evidence only (see the disk
+            # identification notes above). Azure columns are all-or-nothing per volume.
+            local luns="" names="" ids="" size_sum=0 size_seen=0
+            local lun_ok=1 az_ok=1 any_disk=0 any_os=0 any_unknown=0 found
             for disk in $DISK_LIST; do
-                osflag=0
-                case " $ROOT_DISKS " in *" $disk "*) osflag=1 ;; esac
-                if [ $osflag -eq 1 ]; then
-                    is_os=true
-                    if [ $IMDS_OK -eq 1 ]; then
+                any_disk=1
+                if [ -n "$OS_DISK" ] && [ "$disk" = "$OS_DISK" ]; then
+                    # The OS disk. It has no LUN and is mapped through IMDS osDisk.
+                    any_os=1
+                    if [ $IMDS_OK -eq 1 ] && [ -n "$IMDS_OS_ID" ]; then
                         names="${names:+$names,}$IMDS_OS_NAME"
                         ids="${ids:+$ids,}$IMDS_OS_ID"
                         if [[ $IMDS_OS_SIZE =~ ^[0-9]+$ ]]; then size_sum=$((size_sum + IMDS_OS_SIZE)); size_seen=1; fi
+                    else
+                        az_ok=0
                     fi
-                else
-                    lun=$(disk_lun "$disk")
-                    if [ -n "$lun" ]; then
-                        luns="${luns:+$luns,}$lun"
-                        if [ $IMDS_OK -eq 1 ]; then
-                            for ((k = 0; k < ${#IMDS_LUN[@]}; k++)); do
-                                if [ "${IMDS_LUN[k]}" = "$lun" ]; then
-                                    names="${names:+$names,}${IMDS_NAME[k]}"
-                                    ids="${ids:+$ids,}${IMDS_ID[k]}"
-                                    if [[ ${IMDS_SIZE[k]} =~ ^[0-9]+$ ]]; then size_sum=$((size_sum + IMDS_SIZE[k])); size_seen=1; fi
-                                    break
-                                fi
-                            done
-                        fi
-                    fi
+                    continue
                 fi
+
+                lun=$(disk_lun "$disk")
+                if [ -n "$lun" ]; then
+                    # A data disk, confirmed by Azure's link: therefore not the OS disk.
+                    luns="${luns:+$luns,}$lun"
+                    found=0
+                    if [ $IMDS_OK -eq 1 ]; then
+                        for ((k = 0; k < ${#IMDS_LUN[@]}; k++)); do
+                            if [ "${IMDS_LUN[k]}" = "$lun" ] && [ -n "${IMDS_ID[k]}" ]; then
+                                names="${names:+$names,}${IMDS_NAME[k]}"
+                                ids="${ids:+$ids,}${IMDS_ID[k]}"
+                                if [[ ${IMDS_SIZE[k]} =~ ^[0-9]+$ ]]; then size_sum=$((size_sum + IMDS_SIZE[k])); size_seen=1; fi
+                                found=1
+                                break
+                            fi
+                        done
+                    fi
+                    [ $found -eq 1 ] || az_ok=0
+                    continue
+                fi
+
+                # No link: this disk cannot be mapped to a managed disk (LUN or Azure columns).
+                lun_ok=0
+                az_ok=0
+                case " $RES_DISKS " in
+                    *" $disk "*) ;;                      # resource / local disk: known not OS
+                    *) [ -z "$OS_DISK" ] && any_unknown=1 ;;   # OS disk known => this one is not it
+                esac
             done
+
+            [ $lun_ok -eq 1 ] || luns=""
+            if [ $az_ok -ne 1 ]; then
+                names=""; ids=""; size_seen=0
+            fi
+
+            # IsOsDisk: true if the volume touches the OS disk; false only when every disk is
+            # established as not the OS disk; otherwise null (unknown).
+            local is_os=""
+            if [ $any_disk -eq 1 ]; then
+                if [ $any_os -eq 1 ]; then
+                    is_os=true
+                elif [ $any_unknown -eq 0 ]; then
+                    is_os=false
+                fi
+            fi
+
             V_LUN[i]=$luns
             V_ISOS[i]=$is_os
             V_AZNAME[i]=$names

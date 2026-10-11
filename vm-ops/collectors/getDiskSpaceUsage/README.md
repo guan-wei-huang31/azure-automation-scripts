@@ -19,11 +19,13 @@ only to the guest OS, so it has to be collected by running a command inside the 
 Both collectors take the same named parameters and write the same table, so Windows and Linux
 results can be queried together.
 
-> **Orchestrator scope:** `Invoke-ScriptOnVms.ps1` currently deploys the **Windows** collector
-> only (`Microsoft.Compute` / `CustomScriptExtension`, `powershell.exe`). The Linux collector
-> works standalone; deploying it fleet-wide needs the Linux extension type
-> (`Microsoft.Azure.Extensions` / `CustomScript`) and a bash command line, which is not yet
-> implemented in the orchestrator.
+> **Orchestrator OS support:** `Invoke-ScriptOnVms.ps1` picks the collector and extension type
+> per VM from its OS. `-OsType` selects who is targeted: `Windows` (default), `Linux`, or `All`.
+>
+> | VM OS | Collector | Extension |
+> |---|---|---|
+> | Windows | `Get-DiskSpaceUsage.ps1` | `Microsoft.Compute` / `CustomScriptExtension` 1.10 |
+> | Linux | `Get-DiskSpaceUsage.sh` | `Microsoft.Azure.Extensions` / `CustomScript` 2.1 |
 
 ## How it works
 
@@ -48,17 +50,18 @@ answered by the host and needs no Azure credentials.
 
 ## Quick start
 
-### Orchestrator (Windows VMs)
+### Orchestrator
 
 ```powershell
-# defaults: storage account stdiskusagetest01, extension name GoCloudCustomScript, Windows VMs
+# defaults: storage account stdiskusagetest01, extension name GoCloudCustomScript, Windows VMs only
 .\Invoke-ScriptOnVms.ps1
 
 # one test VM only (recommended for the first run)
 .\Invoke-ScriptOnVms.ps1 -QueryScope "name =~ 'vm-diskusage-wi'"
+.\Invoke-ScriptOnVms.ps1 -OsType Linux -QueryScope "name =~ 'vm-diskusage-linux'"
 
-# unattended, e.g. Azure Automation
-.\Invoke-ScriptOnVms.ps1 -UseManagedIdentity -ThrottleLimit 20 -RemoveExtensionAfterRun
+# Windows and Linux together, unattended (e.g. Azure Automation)
+.\Invoke-ScriptOnVms.ps1 -OsType All -UseManagedIdentity -ThrottleLimit 20 -RemoveExtensionAfterRun
 ```
 
 | Parameter | Default | Meaning |
@@ -69,8 +72,10 @@ answered by the host and needs no Azure credentials.
 | `-TableName` | `AzureVMDiskUsage` | Results table (created if missing) |
 | `-ExtensionName` | `GoCloudCustomScript` | Name of the extension deployed on each VM |
 | `-ContainerName` | `vm-ops-scripts` | Private container used to stage the script |
-| `-ScriptPath` | `Get-DiskSpaceUsage.ps1` next to the orchestrator | Collector to deploy |
-| `-QueryScope` | `vmOSType =~ 'Windows'` | KQL predicate appended as `\| where ...`; columns: `name`, `resourceGroup`, `subscriptionId`, `location`, `tags`, `vmOSType` |
+| `-OsType` | `Windows` | Which running VMs to target: `Windows`, `Linux` or `All` |
+| `-WindowsScriptPath` (alias `-ScriptPath`) | `Get-DiskSpaceUsage.ps1` next to the orchestrator | Windows collector |
+| `-LinuxScriptPath` | `Get-DiskSpaceUsage.sh` next to the orchestrator | Linux collector (must be LF line endings) |
+| `-QueryScope` | `true` | Extra KQL predicate appended as `\| where ...` after the OS filter; columns: `name`, `resourceGroup`, `subscriptionId`, `location`, `tags`, `vmOSType` |
 | `-SubscriptionIds` | all visible | Limit the VM query |
 | `-ThrottleLimit` | `10` | Concurrent deployments |
 | `-SasValidityHours` | `6` | Lifetime of the generated SAS tokens |
@@ -122,22 +127,44 @@ Never commit SAS tokens to source control or logs.
    | | Windows | Linux |
    |---|---|---|
    | `SizeGB` | volume size | `df` size |
-   | `UsedGB` | `SizeGB - FreeGB` | `df` **Used**: blocks actually holding data (reserved-for-root blocks excluded; this is what a backup copies) |
+   | `UsedGB` | `SizeGB - FreeGB` | `df` **Used**: blocks the filesystem reports in use (reserved-for-root blocks excluded) |
    | `FreeGB` | `SizeRemaining` | `df` **Available** (what non-root users can use) |
    | `PercentFree` | `FreeGB / SizeGB` | `Available / Size`, from the raw KiB values (not the rounded GB) |
 
    On Linux `UsedGB + FreeGB` can be below `SizeGB` by the reserved blocks. GB means GiB
    (1,073,741,824 bytes) on both.
-5. **Azure correlation is best-effort and never guessed.** If IMDS is unreachable or a disk
-   cannot be matched, `LUN` / `AzureDisk*` stay `null` and `Error` is still `None`. Usage values
-   are collected independently and are always reported. `AzureDiskSizeGB` is the provisioned
-   managed-disk size; `SizeGB` is the guest volume size.
+
+   **`UsedGB` is an estimate for sizing a backup, not an exact backup size.** It is a
+   filesystem-level figure, while Azure Backup works on whole disks. Blocks of deleted files that
+   were never discarded, unallocated LVM space, swap and raw partitions are not reflected, and an
+   unmapped volume (below) must not be assumed to be part of a backup.
+5. **Azure correlation uses platform evidence only and is never guessed.** If IMDS is
+   unreachable or a disk cannot be identified, `LUN` / `AzureDisk*` stay `null` and `Error` is
+   still `None`. Usage values are collected independently and are always reported.
+   `AzureDiskSizeGB` is the provisioned managed-disk size; `SizeGB` is the guest volume size.
+   On Linux a disk is identified only from Azure's udev links:
+
+   | Disk | Evidence |
+   |---|---|
+   | OS disk | `/dev/disk/azure/root` (SCSI) or `/dev/disk/azure/os` (NVMe); without a link, the disk under `/` **only if it is a single disk** |
+   | Data disk | `/dev/disk/azure/scsi1/lunN` or `/dev/disk/azure/data/by-lun/N` |
+   | Resource / local disk | `/dev/disk/azure/resource`, `/dev/disk/azure/local/*` (not a managed disk) |
+
+   SCSI addresses and controller numbers are **not** used to infer a LUN. If the links are
+   missing (Azure agent / azure-vm-utils rules not installed) the mapping stays `null`.
 6. **Temporary / resource disks are not managed disks**, so they have no Azure disk columns.
-7. **A volume can span several disks** (Linux LVM / RAID). Then `LUN`, `AzureDiskName` and
-   `AzureDiskResourceId` are comma-separated and `AzureDiskSizeGB` is the sum.
+7. **A volume can span several disks** (Linux LVM / RAID), and the Azure columns are filled
+   **all-or-nothing**: only when *every* disk under the volume is identified are `LUN`,
+   `AzureDiskName` and `AzureDiskResourceId` comma-separated and `AzureDiskSizeGB` the sum.
+   If any disk is unidentified they stay `null`, so a partial list is never mistaken for the
+   whole volume. `IsOsDisk` follows the same rule: `true` if the volume touches the OS disk,
+   `false` only when every disk is established as not the OS disk, otherwise `null`.
+   If `/` spans several disks and Azure's OS-disk link is absent, the OS disk is unknown and
+   nothing is attributed to it.
 8. **A VM can have only one Custom Script Extension handler.** The orchestrator deploys under the
    name `GoCloudCustomScript`; if a VM already has that extension, **its settings are replaced**
-   by this run. Test on one VM first.
+   by this run. Test on one VM first. Linux VMs are never touched unless you pass
+   `-OsType Linux` or `-OsType All`.
 9. **SAS handling.** The table SAS is limited to the one table, add/update only, and short-lived.
    It travels in the extension's `protectedSettings` (encrypted). On Linux, curl receives the
    URL on stdin (`-K -`) so the SAS is not in curl's argument list.
@@ -189,9 +216,12 @@ into the collector's host-level row.
 
 - Windows: only fixed volumes **with a drive letter** are reported; mounted folders without a
   letter are skipped. Storage Spaces and unusual layouts may not map to a single disk.
-- Linux: data-disk LUNs come from Azure's udev links (`/dev/disk/azure/scsi1/lunN`,
-  `/dev/disk/azure/data/by-lun/N`), with a sysfs fallback. NVMe disks are only mapped when those
-  links exist.
+- Linux: disk identification relies on Azure's udev links under `/dev/disk/azure` (see point 5).
+  There is no sysfs/SCSI-address fallback, so VMs without those links (or NVMe VMs without
+  azure-vm-utils) are collected for usage but left unmapped.
+- Linux: IMDS is parsed in plain bash (no `jq`). It tolerates whitespace and numeric
+  `lun` / `diskSizeGB`, but is written for the documented `storageProfile` shape and is not a
+  general JSON parser.
 - Linux: one row per backing device. Bind mounts and Btrfs subvolumes of the same device collapse
   into one row (the one mounted at `/` is preferred).
 - Linux: loop devices, optical drives, RAM disks and non-`/dev` sources (tmpfs, overlay, NFS)
@@ -204,17 +234,25 @@ into the collector's host-level row.
 - **Windows collector:** run on a Windows VM; OS disk and data disk rows reported with Azure disk
   mapping.
 - **Linux collector:** run on an Ubuntu VM (OS disk `/`, `/boot/efi`, data disk `/data`).
-  Subsequent changes (LUN mapping via Azure udev links, `df` Used for `UsedGB`, PercentFree from
-  raw KiB, error handling) were made after that run and **have not been re-run on a VM yet**.
-  RHEL/Rocky/Alma (including LVM), SLES, NVMe and md RAID are untested.
-- **Orchestrator:** written but not yet run against real VMs.
+  That run used an earlier version. Everything since (LUN mapping from Azure udev links only,
+  OS-disk detection from `/dev/disk/azure/root`|`os`, all-or-nothing Azure columns, `df` Used for
+  `UsedGB`, PercentFree from raw KiB, error handling) **has not been re-run on a VM yet**. Only
+  the IMDS parser has been exercised, offline, against synthetic responses (whitespace, numeric
+  values, several data disks, no data disks). RHEL/Rocky/Alma (including LVM), SLES, NVMe, md
+  RAID and a root volume spanning several disks are untested.
+- **Orchestrator:** written but **not yet run against real VMs** (neither the Windows nor the
+  Linux path). The script parses cleanly and the Linux argument quoting was checked locally, but
+  no extension has been deployed with it yet.
 
 ## Pre-deployment checklist
 
-- [ ] Run the orchestrator against **one** Windows VM (`-QueryScope "name =~ '<vm>'"`) and check the rows.
+- [ ] Run the orchestrator against **one** VM per OS (`-OsType <Windows|Linux> -QueryScope "name =~ '<vm>'"`) and check the rows.
+- [ ] Linux: confirm `Get-DiskSpaceUsage.sh` has LF line endings after checkout (the repo's `.gitattributes` enforces this).
 - [ ] Confirm the account allows shared-key access (the orchestrator uses `listKeys`); otherwise switch it to Entra ID authorization.
 - [ ] Confirm replacing `GoCloudCustomScript` on target VMs is acceptable.
 - [ ] Decide latest-state vs history before relying on the table for trends (points 2 and 3).
 - [ ] Re-run the Linux collector on Ubuntu, then on a RHEL-family VM with LVM, and on SLES.
-- [ ] Add Linux support to the orchestrator if Linux VMs should be collected fleet-wide.
+- [ ] Test a Linux VM with **two or more data disks** (checks the IMDS array and per-LUN mapping).
+- [ ] Test a volume group that spans the OS disk and a data disk (the OS disk must not be attributed to the data disk).
+- [ ] Test a VM without `/dev/disk/azure` links and confirm the Azure columns are `null`, not guessed.
 - [ ] Test failure paths: invalid SAS, IMDS blocked, a VM that already has a different extension.
