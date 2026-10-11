@@ -36,6 +36,19 @@
 #     the whole volume. IsOsDisk is true / false only when that can be established, else null.
 #     The core SizeGB/UsedGB/FreeGB values are always collected independently of all of this.
 #
+#     Two-phase reporting, so the usage figures can never be lost to a mapping problem:
+#
+#         phase 1  df usage per volume is written to the table immediately, with
+#                  Error = "Azure disk mapping pending".
+#         phase 2  IMDS + disk identification are then attempted, and each row is MERGEd again:
+#                  Error = "None" when mapped, or
+#                  Error = "Azure disk mapping unavailable: <reason>" when not.
+#
+#     "Unavailable" does not mean the usage is wrong and is not a script failure (exit code 0);
+#     downstream consumers should treat rows whose Error starts with that prefix as usage-valid.
+#     A row still saying "pending" means the run ended before phase 2 reached that volume.
+#     A failure to read a volume's usage, or to write to the table, exits 1.
+#
 #     Space values: SizeGB = filesystem size, UsedGB = blocks the filesystem reports as in use
 #     (df "Used"; reserved-for-root blocks are not counted), FreeGB = space available to
 #     non-root users (df "Available"), PercentFree = FreeGB / SizeGB, as in the Windows script.
@@ -83,10 +96,15 @@ fi
 
 export LC_ALL=C
 
-#region Parameters -------------------------------------------------------------------------
+#
+# Layout: settings and state, then ALL functions, then main() and the single call to it at the
+# bottom. Nothing runs until main is called.
+#
 
-# All parameters have defaults ON PURPOSE: the Custom Script Extension is non-interactive and
-# a missing value must fail fast, not wait for input.
+#region Settings and state ----------------------------------------------------------------------
+
+# Parameters. All have defaults ON PURPOSE: the Custom Script Extension is non-interactive and a
+# missing value must fail fast, not wait for input.
 AccountName=""
 SasToken=""
 RunId=""
@@ -95,33 +113,116 @@ AzureVmId=""
 SubscriptionName=""
 SubscriptionId=""
 
-while [ $# -gt 0 ]; do
-    opt=$1
-    case $opt in
-        -*)
-            key=${opt#"${opt%%[!-]*}"}          # strip leading dashes
-            if [[ $key == *=* ]]; then
-                val=${key#*=}
-                key=${key%%=*}
-                shift
-            else
-                val=${2-}
-                if [ $# -ge 2 ]; then shift 2; else shift; fi
-            fi
-            key=$(printf '%s' "$key" | tr 'A-Z' 'a-z' | tr -d '_-')
-            case $key in
-                accountname)      AccountName=$val ;;
-                sastoken)         SasToken=$val ;;
-                runid)            RunId=$val ;;
-                tablename)        TableName=$val ;;
-                azurevmid)        AzureVmId=$val ;;
-                subscriptionname) SubscriptionName=$val ;;
-                subscriptionid)   SubscriptionId=$val ;;
-            esac
-            ;;
-        *) shift ;;
-    esac
-done
+# Run context (set in main)
+StartTime=""
+HostName=""
+VMName=""
+HostRowKey=""
+TableUri=""
+
+# Tools (set in init_tools)
+HTTP_TOOL=""
+DF_PREFIX=""
+
+# Error reporting
+ERR_MSG=""
+ERROR_LOGGED=0
+
+# Entity (JSON) being built
+ENT=""
+
+# IMDS inventory (get_azure_disk_inventory)
+IMDS_OS_NAME=""
+IMDS_OS_ID=""
+IMDS_OS_SIZE=""
+IMDS_LUN=()
+IMDS_NAME=()
+IMDS_ID=()
+IMDS_SIZE=()
+IMDS_OK=0
+
+# Disk resolution
+DISK_LIST=""     # space separated kernel whole-disk names (result of collect_disks)
+R_NAME=""        # kernel block device name (result of resolve_block)
+AZ_LUN_DEV=()    # data disks: /dev/<disk> paths ...
+AZ_LUN_NUM=()    # ... and their LUNs (parallel arrays)
+OS_DISK=""       # kernel name of THE OS disk, or empty when it cannot be established
+RES_DISKS=""     # space separated kernel names of resource / local disks
+
+# Volumes: parallel arrays, one entry per volume
+V_MNT=(); V_ROOTFLAG=(); V_SRC=(); V_MM=(); V_FS=()
+V_LABEL=(); V_SIZE=(); V_USED=(); V_FREE=(); V_PCT=()
+V_DEVICE=(); V_DISKDEV=(); V_LUN=(); V_ISOS=()
+V_AZNAME=(); V_AZID=(); V_AZSIZE=()
+V_ERR=()         # usage could not be read (empty = ok); final error row for that volume
+V_MAPERR=()      # why the Azure mapping is unavailable (empty = mapped)
+V_KEY=()         # RowKey
+V_WRITTEN=()     # 1 once phase 1 reached the table
+
+ROOT_SRC=""
+ROOT_MM=""
+ROOT_DISKS=""
+LBL_DEV=()
+LBL_NAME=()
+
+#endregion Settings and state
+
+#region Setup -----------------------------------------------------------------------------------
+
+# Read the named options into the parameter variables. Accepts --AccountName value,
+# -AccountName value or --AccountName=value, case-insensitive, with or without - and _ in the
+# name (so --account-name works too). Unknown options are ignored.
+parse_args() {
+    local opt key val
+
+    while [ $# -gt 0 ]; do
+        opt=$1
+        case $opt in
+            -*)
+                key=${opt#"${opt%%[!-]*}"}          # strip leading dashes
+                if [[ $key == *=* ]]; then
+                    val=${key#*=}
+                    key=${key%%=*}
+                    shift
+                else
+                    val=${2-}
+                    if [ $# -ge 2 ]; then shift 2; else shift; fi
+                fi
+                key=$(printf '%s' "$key" | tr 'A-Z' 'a-z' | tr -d '_-')
+                case $key in
+                    accountname)      AccountName=$val ;;
+                    sastoken)         SasToken=$val ;;
+                    runid)            RunId=$val ;;
+                    tablename)        TableName=$val ;;
+                    azurevmid)        AzureVmId=$val ;;
+                    subscriptionname) SubscriptionName=$val ;;
+                    subscriptionid)   SubscriptionId=$val ;;
+                esac
+                ;;
+            *) shift ;;
+        esac
+    done
+
+    # Guard against stray leading/trailing whitespace (copy-paste, interactive prompts).
+    AccountName=$(trim "$AccountName")
+    SasToken=$(trim "$SasToken")
+    SasToken=${SasToken#\?}                          # tolerate a leading '?'
+    RunId=$(trim "$RunId")
+    TableName=$(trim "$TableName")
+    [ -n "$TableName" ] || TableName="AzureVMDiskUsage"
+}
+
+# Detect the external tools the script can use.
+init_tools() {
+    # curl is required: bash has no HTTPS client of its own.
+    if command -v curl >/dev/null 2>&1; then
+        HTTP_TOOL=curl
+    fi
+    # Bound the df call so a hung mount cannot stall the whole extension run.
+    if command -v timeout >/dev/null 2>&1; then
+        DF_PREFIX="timeout 30"
+    fi
+}
 
 # Guard against stray leading/trailing whitespace (copy-paste, interactive prompts).
 trim() {
@@ -130,18 +231,10 @@ trim() {
     v=${v%"${v##*[![:space:]]}"}
     printf '%s' "$v"
 }
-AccountName=$(trim "$AccountName")
-SasToken=$(trim "$SasToken")
-SasToken=${SasToken#\?}                          # tolerate a leading '?'
-RunId=$(trim "$RunId")
-TableName=$(trim "$TableName")
-[ -n "$TableName" ] || TableName="AzureVMDiskUsage"
 
-#endregion Parameters
+#endregion Setup
 
-#region Generic helpers --------------------------------------------------------------------
-
-ERR_MSG=""
+#region Generic helpers -------------------------------------------------------------------------
 
 json_escape() {
     local s=$1
@@ -191,21 +284,45 @@ fmt_tenths() {
     fi
 }
 
-# Entity (JSON) builder: accumulates into $ENT.
-ENT=""
+# Stable 8-hex-digit hash (djb2) of a string, pure bash. Used only to disambiguate row keys.
+hash8() {
+    local s=$1 h=5381 i c
+    for ((i = 0; i < ${#s}; i++)); do
+        printf -v c '%d' "'${s:i:1}"
+        h=$(((h * 33 + c) & 0xFFFFFFFF))
+    done
+    printf '%08x' "$h"
+}
+
+# RowKey may not contain / \ # ? or control characters.
+safe_key() {
+    local k=$1
+    k=${k//[\/\\#?]/_}
+    k=${k//[[:cntrl:]]/_}
+    printf '%s' "$k"
+}
+
+#endregion Generic helpers
+
+#region Entity (JSON) builder -------------------------------------------------------------------
+
 ent_raw() { ENT+="${ENT:+,}\"$1\":$2"; }
+
 ent_str() {
     if [ -n "$2" ]; then ent_raw "$1" "\"$(json_escape "$2")\""; else ent_raw "$1" null; fi
 }
+
 ent_num() {
     if [[ $2 =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then ent_raw "$1" "$2"; else ent_raw "$1" null; fi
 }
+
 ent_bool() {
     case $2 in
         true | false) ent_raw "$1" "$2" ;;
         *) ent_raw "$1" null ;;
     esac
 }
+
 ent_common() {
     ent_str RunId "$RunId"
     ent_str StartTime "$StartTime"
@@ -216,21 +333,9 @@ ent_common() {
     ent_str SubscriptionId "$SubscriptionId"
 }
 
-# HTTP helper: curl is required (bash has no HTTPS client of its own).
-HTTP_TOOL=""
-if command -v curl >/dev/null 2>&1; then
-    HTTP_TOOL=curl
-fi
+#endregion Entity (JSON) builder
 
-# Stable 8-hex-digit hash (djb2) of a string, pure bash. Used only to disambiguate row keys.
-hash8() {
-    local s=$1 h=5381 i c
-    for ((i = 0; i < ${#s}; i++)); do
-        printf -v c '%d' "'${s:i:1}"
-        h=$(((h * 33 + c) & 0xFFFFFFFF))
-    done
-    printf '%08x' "$h"
-}
+#region Azure Table write -----------------------------------------------------------------------
 
 # MERGE one entity. $1 PartitionKey, $2 RowKey, $3 JSON body. Returns 1 and sets ERR_MSG on failure.
 write_entity() {
@@ -277,18 +382,9 @@ write_entity() {
     esac
 }
 
-#endregion Generic helpers
+#endregion Azure Table write
 
-#region IMDS -------------------------------------------------------------------------------
-
-IMDS_OS_NAME=""
-IMDS_OS_ID=""
-IMDS_OS_SIZE=""
-IMDS_LUN=()
-IMDS_NAME=()
-IMDS_ID=()
-IMDS_SIZE=()
-IMDS_OK=0
+#region IMDS ------------------------------------------------------------------------------------
 
 # First value of "key" in $1, whether JSON wrote it as a string ("lun":"1") or a number ("lun":1).
 json_first() {
@@ -378,10 +474,7 @@ get_azure_disk_inventory() {
 
 #endregion IMDS
 
-#region Disk resolution --------------------------------------------------------------------
-
-DISK_LIST=""     # space separated kernel whole-disk names (result of collect_disks)
-R_NAME=""        # kernel block device name (result of resolve_block)
+#region Disk resolution and identification ------------------------------------------------------
 
 add_disk() {
     case " $DISK_LIST " in
@@ -439,18 +532,6 @@ collect_disks() {
         add_disk "$n"
     fi
 }
-
-# Disk identification, from Azure's own udev links only (published by the Azure Linux agent /
-# azure-vm-utils). Nothing is inferred from SCSI addresses or controller numbers: a disk with no
-# link is simply "unidentified".
-#
-#   OS disk        /dev/disk/azure/root (SCSI)   /dev/disk/azure/os (NVMe)
-#   Data disk      /dev/disk/azure/scsi1/lunN    /dev/disk/azure/data/by-lun/N
-#   Resource disk  /dev/disk/azure/resource      /dev/disk/azure/local/*  (not a managed disk)
-AZ_LUN_DEV=()      # data disks: /dev/<disk> paths ...
-AZ_LUN_NUM=()      # ... and their LUNs (parallel arrays)
-OS_DISK=""         # kernel name of THE OS disk, or empty when it cannot be established
-RES_DISKS=""       # space separated kernel names of resource / local disks
 
 # Data-disk links, loaded once as device -> LUN.
 load_azure_lun_links() {
@@ -522,32 +603,23 @@ disk_lun() {
     done
 }
 
-#endregion Disk resolution
+#endregion Disk resolution and identification
 
-#region Snapshot ---------------------------------------------------------------------------
+#region Collection (phase 1 usage, phase 2 Azure mapping) ---------------------------------------
 
-# Parallel arrays, one entry per volume.
-V_MNT=(); V_ROOTFLAG=(); V_SRC=(); V_MM=(); V_FS=()
-V_LABEL=(); V_SIZE=(); V_USED=(); V_FREE=(); V_PCT=()
-V_DEVICE=(); V_DISKDEV=(); V_LUN=(); V_ISOS=()
-V_AZNAME=(); V_AZID=(); V_AZSIZE=()
-V_ERR=()    # per-volume collection error (empty = ok); written to the table as that volume's row
+# Collection is split in two so the usage figures can never be lost to a mapping problem:
+#
+#   phase 1  collect_usage    mount list + df  -> written immediately, Error = "...pending"
+#   phase 2  prepare_mapping  IMDS + disk identification, then per volume map_volume
+#                             -> second MERGE: mapping fields + Error "None" or "...unavailable: <why>"
+#
+# Phase 1 depends on nothing Azure-specific or distribution-specific.
 
-# Bound the df call so a hung mount cannot stall the whole extension run.
-DF_PREFIX=""
-if command -v timeout >/dev/null 2>&1; then
-    DF_PREFIX="timeout 30"
-fi
-
-ROOT_SRC=""
-ROOT_MM=""
-
-collect_snapshot() {
-    local line F sep i j k mnt fstype src majmin rootpath dup
+# Phase 1: volumes and their space usage. Returns 1 (ERR_MSG set) only if the mount list itself
+# cannot be read.
+collect_usage() {
+    local line F sep i k mnt fstype src majmin rootpath dup
     local df_out df_line D size_kb used_kb avail_kb size_h free_h used_h pct_t
-    local label dev disk lun
-    local -a LBL_DEV=() LBL_NAME=()
-    local ROOT_DISKS=""
 
     if [ ! -r /proc/self/mountinfo ]; then
         ERR_MSG="/proc/self/mountinfo is not readable"
@@ -606,6 +678,47 @@ collect_snapshot() {
         V_MNT+=("$mnt"); V_ROOTFLAG+=("$rootpath"); V_SRC+=("$src"); V_MM+=("$majmin"); V_FS+=("$fstype")
     done < /proc/self/mountinfo
 
+    for ((i = 0; i < ${#V_MNT[@]}; i++)); do
+        mnt=${V_MNT[i]}
+        V_DEVICE[i]=${V_SRC[i]}
+
+        # Size / used / free via df (1K blocks, POSIX output). Used = blocks the filesystem
+        # reports in use (reserved-for-root blocks excluded; an estimate for backup sizing, not
+        # an exact backup size), Free = available to non-root.
+        df_out=$($DF_PREFIX df -P -k -- "$mnt" 2>/dev/null)
+        df_line=${df_out#*$'\n'}
+        set -f
+        D=($df_line)
+        set +f
+        size_kb=${D[1]}
+        used_kb=${D[2]}
+        avail_kb=${D[3]}
+        if ! [[ $size_kb =~ ^[0-9]+$ && $used_kb =~ ^[0-9]+$ && $avail_kb =~ ^[0-9]+$ ]]; then
+            V_ERR[i]="Could not read disk usage for '$mnt' (df returned no usable values or timed out)"
+            continue
+        fi
+        size_h=$(((size_kb * 100 + 524288) / 1048576))
+        used_h=$(((used_kb * 100 + 524288) / 1048576))
+        free_h=$(((avail_kb * 100 + 524288) / 1048576))
+        V_SIZE[i]=""
+        [ "$size_kb" -gt 0 ] && V_SIZE[i]=$(fmt_hundredths "$size_h")
+        V_FREE[i]=$(fmt_hundredths "$free_h")
+        V_USED[i]=$(fmt_hundredths "$used_h")
+        V_PCT[i]=""
+        if [ "$size_kb" -gt 0 ]; then
+            # Percentage from the raw df KiB values, not the already-rounded GB figures.
+            pct_t=$(((avail_kb * 1000 + size_kb / 2) / size_kb))
+            V_PCT[i]=$(fmt_tenths "$pct_t")
+        fi
+    done
+
+    return 0
+}
+
+# Phase 2 set-up, once for all volumes: OS / data / resource disk evidence, labels, IMDS.
+prepare_mapping() {
+    local label dev
+
     # Disk(s) backing "/" -> fallback evidence for the OS disk when Azure's link is missing.
     if [ -n "$ROOT_SRC" ] && resolve_block "$ROOT_SRC" "$ROOT_MM"; then
         DISK_LIST=""
@@ -628,187 +741,134 @@ collect_snapshot() {
     done
 
     get_azure_disk_inventory
+}
 
-    for ((i = 0; i < ${#V_MNT[@]}; i++)); do
-        mnt=${V_MNT[i]}
+# Phase 2, one volume ($1 = index). Fills V_LABEL / V_DISKDEV / V_LUN / V_ISOS / V_AZ* and sets
+# V_MAPERR to the reason when the volume could not be fully mapped to Azure managed disk(s).
+# Azure columns are all-or-nothing per volume: they are filled only if EVERY disk under the
+# volume is identified, so a partial list is never mistaken for the whole volume.
+map_volume() {
+    local i=$1 j k disk lun
+    local luns="" names="" ids="" size_sum=0 size_seen=0
+    local lun_ok=1 az_ok=1 any_disk=0 any_os=0 any_unknown=0 found is_os=""
+    local reason="" n_disks=0 n_res=0
 
-        # Size / used / free via df (1K blocks, POSIX output). Used = blocks the filesystem
-        # reports in use (reserved-for-root blocks excluded; an estimate for backup sizing, not
-        # an exact backup size), Free = available to non-root.
-        df_out=$($DF_PREFIX df -P -k -- "$mnt" 2>/dev/null)
-        df_line=${df_out#*$'\n'}
-        set -f
-        D=($df_line)
-        set +f
-        size_kb=${D[1]}
-        used_kb=${D[2]}
-        avail_kb=${D[3]}
-        V_DEVICE[i]=${V_SRC[i]}
-        if ! [[ $size_kb =~ ^[0-9]+$ && $used_kb =~ ^[0-9]+$ && $avail_kb =~ ^[0-9]+$ ]]; then
-            # Keep the volume and record why, so the failure is visible in the table.
-            V_ERR[i]="Could not read disk usage for '$mnt' (df returned no usable values or timed out)"
-            continue
-        fi
-        size_h=$(((size_kb * 100 + 524288) / 1048576))
-        used_h=$(((used_kb * 100 + 524288) / 1048576))
-        free_h=$(((avail_kb * 100 + 524288) / 1048576))
-        V_SIZE[i]=""
-        [ "$size_kb" -gt 0 ] && V_SIZE[i]=$(fmt_hundredths "$size_h")
-        V_FREE[i]=$(fmt_hundredths "$free_h")
-        V_USED[i]=$(fmt_hundredths "$used_h")
-        V_PCT[i]=""
-        if [ "$size_kb" -gt 0 ]; then
-            # Percentage from the raw df KiB values, not the already-rounded GB figures.
-            pct_t=$(((avail_kb * 1000 + size_kb / 2) / size_kb))
-            V_PCT[i]=$(fmt_tenths "$pct_t")
-        fi
+    V_LABEL[i]=""; V_DISKDEV[i]=""; V_LUN[i]=""; V_ISOS[i]=""
+    V_AZNAME[i]=""; V_AZID[i]=""; V_AZSIZE[i]=""; V_MAPERR[i]=""
 
-        # Disk correlation (best effort).
-        V_DEVICE[i]=${V_SRC[i]}
-        V_LABEL[i]=""
-        V_DISKDEV[i]=""
-        V_LUN[i]=""
-        V_ISOS[i]=""
-        V_AZNAME[i]=""
-        V_AZID[i]=""
-        V_AZSIZE[i]=""
+    if ! resolve_block "${V_SRC[i]}" "${V_MM[i]}"; then
+        V_MAPERR[i]="could not resolve the block device for ${V_SRC[i]}"
+        return 0
+    fi
 
-        if resolve_block "${V_SRC[i]}" "${V_MM[i]}"; then
-            for ((j = 0; j < ${#LBL_DEV[@]}; j++)); do
-                if [ "${LBL_DEV[j]}" = "/dev/$R_NAME" ]; then V_LABEL[i]=${LBL_NAME[j]}; break; fi
-            done
-
-            DISK_LIST=""
-            collect_disks "$R_NAME"
-            V_DISKDEV[i]=${DISK_LIST// /,}
-
-            # Identify every disk under the volume from platform evidence only (see the disk
-            # identification notes above). Azure columns are all-or-nothing per volume.
-            local luns="" names="" ids="" size_sum=0 size_seen=0
-            local lun_ok=1 az_ok=1 any_disk=0 any_os=0 any_unknown=0 found
-            for disk in $DISK_LIST; do
-                any_disk=1
-                if [ -n "$OS_DISK" ] && [ "$disk" = "$OS_DISK" ]; then
-                    # The OS disk. It has no LUN and is mapped through IMDS osDisk.
-                    any_os=1
-                    if [ $IMDS_OK -eq 1 ] && [ -n "$IMDS_OS_ID" ]; then
-                        names="${names:+$names,}$IMDS_OS_NAME"
-                        ids="${ids:+$ids,}$IMDS_OS_ID"
-                        if [[ $IMDS_OS_SIZE =~ ^[0-9]+$ ]]; then size_sum=$((size_sum + IMDS_OS_SIZE)); size_seen=1; fi
-                    else
-                        az_ok=0
-                    fi
-                    continue
-                fi
-
-                lun=$(disk_lun "$disk")
-                if [ -n "$lun" ]; then
-                    # A data disk, confirmed by Azure's link: therefore not the OS disk.
-                    luns="${luns:+$luns,}$lun"
-                    found=0
-                    if [ $IMDS_OK -eq 1 ]; then
-                        for ((k = 0; k < ${#IMDS_LUN[@]}; k++)); do
-                            if [ "${IMDS_LUN[k]}" = "$lun" ] && [ -n "${IMDS_ID[k]}" ]; then
-                                names="${names:+$names,}${IMDS_NAME[k]}"
-                                ids="${ids:+$ids,}${IMDS_ID[k]}"
-                                if [[ ${IMDS_SIZE[k]} =~ ^[0-9]+$ ]]; then size_sum=$((size_sum + IMDS_SIZE[k])); size_seen=1; fi
-                                found=1
-                                break
-                            fi
-                        done
-                    fi
-                    [ $found -eq 1 ] || az_ok=0
-                    continue
-                fi
-
-                # No link: this disk cannot be mapped to a managed disk (LUN or Azure columns).
-                lun_ok=0
-                az_ok=0
-                case " $RES_DISKS " in
-                    *" $disk "*) ;;                      # resource / local disk: known not OS
-                    *) [ -z "$OS_DISK" ] && any_unknown=1 ;;   # OS disk known => this one is not it
-                esac
-            done
-
-            [ $lun_ok -eq 1 ] || luns=""
-            if [ $az_ok -ne 1 ]; then
-                names=""; ids=""; size_seen=0
-            fi
-
-            # IsOsDisk: true if the volume touches the OS disk; false only when every disk is
-            # established as not the OS disk; otherwise null (unknown).
-            local is_os=""
-            if [ $any_disk -eq 1 ]; then
-                if [ $any_os -eq 1 ]; then
-                    is_os=true
-                elif [ $any_unknown -eq 0 ]; then
-                    is_os=false
-                fi
-            fi
-
-            V_LUN[i]=$luns
-            V_ISOS[i]=$is_os
-            V_AZNAME[i]=$names
-            V_AZID[i]=$ids
-            [ $size_seen -eq 1 ] && V_AZSIZE[i]=$size_sum
-        fi
+    for ((j = 0; j < ${#LBL_DEV[@]}; j++)); do
+        if [ "${LBL_DEV[j]}" = "/dev/$R_NAME" ]; then V_LABEL[i]=${LBL_NAME[j]}; break; fi
     done
 
+    DISK_LIST=""
+    collect_disks "$R_NAME"
+    V_DISKDEV[i]=${DISK_LIST// /,}
+    if [ -z "$DISK_LIST" ]; then
+        V_MAPERR[i]="no underlying disk found for ${V_SRC[i]}"
+        return 0
+    fi
+
+    for disk in $DISK_LIST; do
+        any_disk=1
+        n_disks=$((n_disks + 1))
+
+        if [ -n "$OS_DISK" ] && [ "$disk" = "$OS_DISK" ]; then
+            # The OS disk. It has no LUN and is mapped through IMDS osDisk.
+            any_os=1
+            if [ $IMDS_OK -eq 1 ] && [ -n "$IMDS_OS_ID" ]; then
+                names="${names:+$names,}$IMDS_OS_NAME"
+                ids="${ids:+$ids,}$IMDS_OS_ID"
+                if [[ $IMDS_OS_SIZE =~ ^[0-9]+$ ]]; then size_sum=$((size_sum + IMDS_OS_SIZE)); size_seen=1; fi
+            else
+                az_ok=0
+                if [ $IMDS_OK -ne 1 ]; then
+                    [ -n "$reason" ] || reason="IMDS (169.254.169.254) was unreachable"
+                else
+                    [ -n "$reason" ] || reason="IMDS returned no OS disk id"
+                fi
+            fi
+            continue
+        fi
+
+        lun=$(disk_lun "$disk")
+        if [ -n "$lun" ]; then
+            # A data disk, confirmed by Azure's link: therefore not the OS disk.
+            luns="${luns:+$luns,}$lun"
+            found=0
+            if [ $IMDS_OK -eq 1 ]; then
+                for ((k = 0; k < ${#IMDS_LUN[@]}; k++)); do
+                    if [ "${IMDS_LUN[k]}" = "$lun" ] && [ -n "${IMDS_ID[k]}" ]; then
+                        names="${names:+$names,}${IMDS_NAME[k]}"
+                        ids="${ids:+$ids,}${IMDS_ID[k]}"
+                        if [[ ${IMDS_SIZE[k]} =~ ^[0-9]+$ ]]; then size_sum=$((size_sum + IMDS_SIZE[k])); size_seen=1; fi
+                        found=1
+                        break
+                    fi
+                done
+            fi
+            if [ $found -ne 1 ]; then
+                az_ok=0
+                if [ $IMDS_OK -ne 1 ]; then
+                    [ -n "$reason" ] || reason="IMDS (169.254.169.254) was unreachable"
+                else
+                    [ -n "$reason" ] || reason="LUN $lun is not listed in IMDS"
+                fi
+            fi
+            continue
+        fi
+
+        # No Azure link for this disk: it cannot be mapped to a managed disk.
+        lun_ok=0
+        az_ok=0
+        case " $RES_DISKS " in
+            *" $disk "*)
+                n_res=$((n_res + 1))          # resource / local disk: known not to be the OS disk
+                ;;
+            *)
+                [ -z "$OS_DISK" ] && any_unknown=1   # OS disk known => this one is not it
+                [ -n "$reason" ] || reason="disk $disk has no Azure udev link under /dev/disk/azure, so it cannot be identified"
+                ;;
+        esac
+    done
+
+    if [ $n_res -gt 0 ] && [ $n_res -eq $n_disks ]; then
+        reason="resource / local disk, which is not an Azure managed disk"
+    elif [ $n_res -gt 0 ] && [ -z "$reason" ]; then
+        reason="volume includes a resource / local disk, which is not an Azure managed disk"
+    fi
+
+    [ $lun_ok -eq 1 ] || luns=""
+    if [ $az_ok -ne 1 ]; then
+        names=""; ids=""; size_seen=0
+    fi
+
+    # IsOsDisk: true if the volume touches the OS disk; false only when every disk is
+    # established as not the OS disk; otherwise null (unknown).
+    if [ $any_disk -eq 1 ]; then
+        if [ $any_os -eq 1 ]; then
+            is_os=true
+        elif [ $any_unknown -eq 0 ]; then
+            is_os=false
+        fi
+    fi
+
+    V_LUN[i]=$luns
+    V_ISOS[i]=$is_os
+    V_AZNAME[i]=$names
+    V_AZID[i]=$ids
+    [ $size_seen -eq 1 ] && V_AZSIZE[i]=$size_sum
+    [ $az_ok -eq 1 ] || V_MAPERR[i]=${reason:-"volume could not be mapped to an Azure managed disk"}
     return 0
 }
 
-#endregion Snapshot
+#endregion Collection (phase 1 usage, phase 2 Azure mapping)
 
-#region Main ------------------------------------------------------------------------------
-
-StartTime=$(date '+%Y-%m-%dT%H:%M:%S')
-
-HostName=""
-if [ -r /proc/sys/kernel/hostname ]; then
-    read -r HostName < /proc/sys/kernel/hostname
-fi
-[ -n "$HostName" ] || HostName=$(hostname 2>/dev/null)
-HostName=${HostName%%.*}
-HostName=$(printf '%s' "$HostName" | tr 'A-Z' 'a-z')
-[ -n "$HostName" ] || HostName="unknown-host"   # RowKey must never be empty
-
-if [ -n "$AzureVmId" ]; then
-    VMName=${AzureVmId##*/}
-else
-    VMName=$HostName
-fi
-
-# Without these two there is nowhere to write to, so the only possible report is stderr
-# (visible in the extension status). Everything after this point is logged to the table.
-missing=""
-[ -n "$AccountName" ] || missing="$missing AccountName"
-[ -n "$SasToken" ] || missing="$missing SasToken"
-if [ -n "$missing" ]; then
-    echo "Missing required parameter(s):$missing" >&2
-    exit 1
-fi
-
-# Table URI must be valid before anything else (mirrors the PowerShell URI check).
-if ! [[ $AccountName =~ ^[a-z0-9]{3,24}$ ]] || ! [[ $TableName =~ ^[A-Za-z][A-Za-z0-9]{2,62}$ ]]; then
-    echo "Constructed table URI is invalid - check -AccountName ('$AccountName') and -TableName ('$TableName')" >&2
-    exit 1
-fi
-TableUri="https://${AccountName}.table.core.windows.net/${TableName}"
-
-if [ -z "$HTTP_TOOL" ]; then
-    echo "curl is required to reach Azure Table Storage but was not found" >&2
-    exit 1
-fi
-
-# RowKey may not contain / \ # ? or control characters.
-safe_key() {
-    local k=$1
-    k=${k//[\/\\#?]/_}
-    k=${k//[[:cntrl:]]/_}
-    printf '%s' "$k"
-}
-
-HostRowKey=$(safe_key "$HostName")
+#region Reporting -------------------------------------------------------------------------------
 
 # Failure / informational row for the whole host (RowKey = hostname), like the PS script.
 write_host_row() {
@@ -820,8 +880,6 @@ write_host_row() {
     ent_str Error "$1"
     write_entity "$TableName" "$HostRowKey" "{$ENT}"
 }
-
-ERROR_LOGGED=0
 
 # Log a whole-host failure to the table, report it on stderr and stop.
 fail() {
@@ -836,7 +894,8 @@ fail() {
 }
 
 # Safety net: any non-zero exit that did not already log itself (e.g. the extension timing
-# out and sending SIGTERM, or an unexpected exit) still leaves an error row behind.
+# out and sending SIGTERM, or an unexpected exit) still leaves an error row behind. Volume rows
+# already written stay as they are - a row still saying "mapping pending" is an honest record.
 on_exit() {
     local rc=$?
     if [ $rc -ne 0 ] && [ "$ERROR_LOGGED" -ne 1 ]; then
@@ -844,111 +903,194 @@ on_exit() {
         write_host_row "Disk space collection failed: script terminated unexpectedly (exit code $rc)" >/dev/null 2>&1
     fi
 }
-trap on_exit EXIT
-trap 'exit 143' TERM
-trap 'exit 130' INT
 
-if [ -z "$RunId" ]; then
-    fail "Missing required parameter(s): RunId"
-fi
+#endregion Reporting
 
-collect_snapshot || fail "$ERR_MSG"
+#region Main ------------------------------------------------------------------------------------
 
-vol_count=${#V_MNT[@]}
+main() {
+    local i j mnt seed missing e summary RowKey
 
-if [ "$vol_count" -eq 0 ]; then
-    write_host_row "No fixed volumes found" || fail "$ERR_MSG"
-    exit 0
-fi
+    parse_args "$@"
+    init_tools
 
-# Row keys. Different mount points can sanitise to the same key (/var/lib vs /var_lib); every
-# member of such a group gets a stable hash suffix so none overwrites another.
-V_KEY=()
-for ((i = 0; i < ${#V_MNT[@]}; i++)); do
-    mnt=${V_MNT[i]}
-    [ -n "$mnt" ] || continue
-    if [ "$mnt" = "/" ]; then
-        seed=root
-    else
-        seed=${mnt#/}
-        seed=${seed//\//_}
+    StartTime=$(date '+%Y-%m-%dT%H:%M:%S')
+
+    if [ -r /proc/sys/kernel/hostname ]; then
+        read -r HostName < /proc/sys/kernel/hostname
     fi
-    V_KEY[i]=$(safe_key "${HostName}_${seed}")
-done
-for ((i = 0; i < ${#V_MNT[@]}; i++)); do
-    [ -n "${V_MNT[i]}" ] || continue
-    for ((j = 0; j < ${#V_MNT[@]}; j++)); do
-        [ "$j" -ne "$i" ] || continue
-        [ -n "${V_MNT[j]}" ] || continue
-        if [ "${V_KEY[j]}" = "${V_KEY[i]}" ]; then
-            V_KEY[i]="${V_KEY[i]}_$(hash8 "${V_MNT[i]}")"
-            break
+    [ -n "$HostName" ] || HostName=$(hostname 2>/dev/null)
+    HostName=${HostName%%.*}
+    HostName=$(printf '%s' "$HostName" | tr 'A-Z' 'a-z')
+    [ -n "$HostName" ] || HostName="unknown-host"   # RowKey must never be empty
+    HostRowKey=$(safe_key "$HostName")
+
+    if [ -n "$AzureVmId" ]; then
+        VMName=${AzureVmId##*/}
+    else
+        VMName=$HostName
+    fi
+
+    # --- Preconditions -----------------------------------------------------------------------
+    # Without AccountName and SasToken there is nowhere to write to, so the only possible report
+    # is stderr (visible in the extension status). Everything after this is logged to the table.
+    missing=""
+    [ -n "$AccountName" ] || missing="$missing AccountName"
+    [ -n "$SasToken" ] || missing="$missing SasToken"
+    if [ -n "$missing" ]; then
+        echo "Missing required parameter(s):$missing" >&2
+        exit 1
+    fi
+
+    # Table URI must be valid before anything else (mirrors the PowerShell URI check).
+    if ! [[ $AccountName =~ ^[a-z0-9]{3,24}$ ]] || ! [[ $TableName =~ ^[A-Za-z][A-Za-z0-9]{2,62}$ ]]; then
+        echo "Constructed table URI is invalid - check -AccountName ('$AccountName') and -TableName ('$TableName')" >&2
+        exit 1
+    fi
+    TableUri="https://${AccountName}.table.core.windows.net/${TableName}"
+
+    if [ -z "$HTTP_TOOL" ]; then
+        echo "curl is required to reach Azure Table Storage but was not found" >&2
+        exit 1
+    fi
+
+    # From here on a failure is logged to the table. The EXIT trap is a safety net for a
+    # termination (e.g. SIGTERM from the extension timing out) that did not log itself.
+    trap on_exit EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+
+    if [ -z "$RunId" ]; then
+        fail "Missing required parameter(s): RunId"
+    fi
+
+    # --- Phase 1: usage ----------------------------------------------------------------------
+    collect_usage || fail "$ERR_MSG"
+
+    if [ ${#V_MNT[@]} -eq 0 ]; then
+        write_host_row "No fixed volumes found" || fail "$ERR_MSG"
+        exit 0
+    fi
+
+    # Row keys. Different mount points can sanitise to the same key (/var/lib vs /var_lib);
+    # every member of such a group gets a stable hash suffix so none overwrites another.
+    for ((i = 0; i < ${#V_MNT[@]}; i++)); do
+        mnt=${V_MNT[i]}
+        if [ "$mnt" = "/" ]; then
+            seed=root
+        else
+            seed=${mnt#/}
+            seed=${seed//\//_}
         fi
+        V_KEY[i]=$(safe_key "${HostName}_${seed}")
     done
-done
+    for ((i = 0; i < ${#V_MNT[@]}; i++)); do
+        for ((j = 0; j < ${#V_MNT[@]}; j++)); do
+            [ "$j" -ne "$i" ] || continue
+            if [ "${V_KEY[j]}" = "${V_KEY[i]}" ]; then
+                V_KEY[i]="${V_KEY[i]}_$(hash8 "${V_MNT[i]}")"
+                break
+            fi
+        done
+    done
 
-# One bad volume must not stop the others: record every failure, keep going, and report at
-# the end. A volume whose usage could not be read still gets its own row carrying the error.
-VOL_ERRORS=()
-WRITE_FAILED=0
+    # One bad volume must not stop the others: record every failure, keep going, and report at
+    # the end. A volume whose usage could not be read gets its own row carrying the error.
+    VOL_ERRORS=()
+    WRITE_FAILED=0
 
-for ((i = 0; i < ${#V_MNT[@]}; i++)); do
-    mnt=${V_MNT[i]}
-    [ -n "$mnt" ] || continue
+    for ((i = 0; i < ${#V_MNT[@]}; i++)); do
+        mnt=${V_MNT[i]}
+        RowKey=${V_KEY[i]}
 
-    RowKey=${V_KEY[i]}
-
-    ENT=""
-    ent_str PartitionKey "$TableName"
-    ent_str RowKey "$RowKey"
-    ent_common
-    ent_str EndTime "$(date '+%Y-%m-%dT%H:%M:%S')"
-    ent_str DriveLetter "$mnt"
-
-    if [ -n "${V_ERR[i]:-}" ]; then
+        ENT=""
+        ent_str PartitionKey "$TableName"
+        ent_str RowKey "$RowKey"
+        ent_common
+        ent_str EndTime "$(date '+%Y-%m-%dT%H:%M:%S')"
+        ent_str DriveLetter "$mnt"
         ent_str FileSystem "${V_FS[i]}"
         ent_str Device "${V_DEVICE[i]}"
-        ent_str Error "Disk space collection failed: ${V_ERR[i]:0:1500}"
-        VOL_ERRORS+=("${V_ERR[i]}")
-    else
+
+        if [ -n "${V_ERR[i]:-}" ]; then
+            ent_str Error "Disk space collection failed: ${V_ERR[i]:0:1500}"
+            VOL_ERRORS+=("${V_ERR[i]}")
+        else
+            ent_num SizeGB "${V_SIZE[i]}"
+            ent_num UsedGB "${V_USED[i]}"
+            ent_num FreeGB "${V_FREE[i]}"
+            ent_num PercentFree "${V_PCT[i]}"
+            ent_str Error "Azure disk mapping pending"
+        fi
+
+        if write_entity "$TableName" "$RowKey" "{$ENT}"; then
+            V_WRITTEN[i]=1
+        else
+            WRITE_FAILED=1
+            VOL_ERRORS+=("table write failed for '$mnt': $ERR_MSG")
+        fi
+    done
+
+    # --- Phase 2: Azure disk mapping ---------------------------------------------------------
+    # Everything from here is best effort. The usage above is already in the table, so a
+    # failure, an error or even a hang below can only leave a row saying "mapping pending" or
+    # "unavailable".
+    prepare_mapping
+
+    for ((i = 0; i < ${#V_MNT[@]}; i++)); do
+        mnt=${V_MNT[i]}
+        [ -n "${V_ERR[i]:-}" ] && continue             # usage failed: row already final
+        [ "${V_WRITTEN[i]:-0}" = 1 ] || continue       # phase 1 never reached the table
+
+        map_volume "$i"
+        RowKey=${V_KEY[i]}
+
+        ENT=""
+        ent_str PartitionKey "$TableName"
+        ent_str RowKey "$RowKey"
+        ent_str EndTime "$(date '+%Y-%m-%dT%H:%M:%S')"
         ent_str FileSystemLabel "${V_LABEL[i]}"
-        ent_str FileSystem "${V_FS[i]}"
-        ent_num SizeGB "${V_SIZE[i]}"
-        ent_num UsedGB "${V_USED[i]}"
-        ent_num FreeGB "${V_FREE[i]}"
-        ent_num PercentFree "${V_PCT[i]}"
         ent_raw DiskNumber null
         if [[ ${V_LUN[i]} =~ ^[0-9]+$ ]]; then ent_num LUN "${V_LUN[i]}"; else ent_str LUN "${V_LUN[i]}"; fi
         ent_bool IsOsDisk "${V_ISOS[i]}"
         ent_str AzureDiskName "${V_AZNAME[i]}"
         ent_str AzureDiskResourceId "${V_AZID[i]}"
         ent_num AzureDiskSizeGB "${V_AZSIZE[i]}"
-        ent_str Device "${V_DEVICE[i]}"
         ent_str DiskDevice "${V_DISKDEV[i]}"
-        ent_str Error "None"
-    fi
 
-    if ! write_entity "$TableName" "$RowKey" "{$ENT}"; then
-        WRITE_FAILED=1
-        VOL_ERRORS+=("table write failed for '$mnt': $ERR_MSG")
-    fi
-done
+        if [ -n "${V_MAPERR[i]}" ]; then
+            # Not a script failure: usage is valid. Reported in the row and on stderr only.
+            ent_str Error "Azure disk mapping unavailable: ${V_MAPERR[i]:0:1500}"
+            echo "WARNING: Azure disk mapping unavailable for '$mnt': ${V_MAPERR[i]}" >&2
+        else
+            ent_str Error "None"
+        fi
 
-if [ ${#VOL_ERRORS[@]} -gt 0 ]; then
-    SUMMARY=""
-    for e in "${VOL_ERRORS[@]}"; do
-        echo "ERROR: $e" >&2
-        SUMMARY="${SUMMARY:+$SUMMARY | }$e"
+        if ! write_entity "$TableName" "$RowKey" "{$ENT}"; then
+            WRITE_FAILED=1
+            VOL_ERRORS+=("table write (mapping) failed for '$mnt': $ERR_MSG")
+        fi
     done
-    ERROR_LOGGED=1
-    # Volume-level errors are already in their own rows. If the table itself rejected writes,
-    # make one more best-effort attempt to leave a host-level summary.
-    if [ $WRITE_FAILED -eq 1 ]; then
-        write_host_row "Disk space collection failed: ${SUMMARY:0:1500}" >/dev/null 2>&1
-    fi
-    exit 1
-fi
 
-exit 0
+    # --- Result ------------------------------------------------------------------------------
+    if [ ${#VOL_ERRORS[@]} -gt 0 ]; then
+        summary=""
+        for e in "${VOL_ERRORS[@]}"; do
+            echo "ERROR: $e" >&2
+            summary="${summary:+$summary | }$e"
+        done
+        ERROR_LOGGED=1
+        # Volume-level errors are already in their own rows. If the table itself rejected
+        # writes, make one more best-effort attempt to leave a host-level summary.
+        if [ $WRITE_FAILED -eq 1 ]; then
+            write_host_row "Disk space collection failed: ${summary:0:1500}" >/dev/null 2>&1
+        fi
+        exit 1
+    fi
+
+    exit 0
+}
 
 #endregion Main
+
+main "$@"

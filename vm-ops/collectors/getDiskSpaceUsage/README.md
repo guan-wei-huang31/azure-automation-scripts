@@ -139,8 +139,10 @@ Never commit SAS tokens to source control or logs.
    were never discarded, unallocated LVM space, swap and raw partitions are not reflected, and an
    unmapped volume (below) must not be assumed to be part of a backup.
 5. **Azure correlation uses platform evidence only and is never guessed.** If IMDS is
-   unreachable or a disk cannot be identified, `LUN` / `AzureDisk*` stay `null` and `Error` is
-   still `None`. Usage values are collected independently and are always reported.
+   unreachable or a disk cannot be identified, `LUN` / `AzureDisk*` stay `null`. Windows leaves
+   `Error` as `None`; Linux sets `Azure disk mapping unavailable: <reason>` (see the two-phase
+   write below). Usage values are collected independently and are always reported, and on Linux
+   they are written **before** any mapping is attempted.
    `AzureDiskSizeGB` is the provisioned managed-disk size; `SizeGB` is the guest volume size.
    On Linux a disk is identified only from Azure's udev links:
 
@@ -190,16 +192,39 @@ Never commit SAS tokens to source control or logs.
 | `AzureDiskName`, `AzureDiskResourceId`, `AzureDiskSizeGB` | yes | yes |
 | `Device` | - | filesystem source, e.g. `/dev/sda1`, `/dev/mapper/rootvg-rootlv` |
 | `DiskDevice` | - | underlying kernel disk(s), e.g. `sda`, `sdc,sdd` |
-| `Error` | `None` or message | `None` or message |
+| `Error` | `None` or message | `None`, `Azure disk mapping pending`, `Azure disk mapping unavailable: <reason>`, or a failure message |
 
 Linux `RowKey`: if two mount points sanitise to the same key (e.g. `/var/lib` and `/var_lib`),
 both get a stable 8-character hash suffix so neither overwrites the other.
+
+### Linux: two-phase write and the `Error` column
+
+The Linux collector writes each volume **twice** (MERGE on the same row) so that usage is never
+lost to a mapping problem:
+
+| Phase | Writes | `Error` |
+|---|---|---|
+| 1. usage | `DriveLetter`, `FileSystem`, `Device`, `SizeGB`, `UsedGB`, `FreeGB`, `PercentFree` | `Azure disk mapping pending` |
+| 2. mapping (IMDS + disk identification) | `FileSystemLabel`, `LUN`, `IsOsDisk`, `AzureDisk*`, `DiskDevice` | `None` if mapped, otherwise `Azure disk mapping unavailable: <reason>` |
+
+How to read a Linux row:
+
+| `Error` | Meaning | Usage values |
+|---|---|---|
+| `None` | Fully mapped to Azure managed disk(s) | valid |
+| `Azure disk mapping unavailable: ...` | Usage read fine; the disk(s) could not be identified | **valid** |
+| `Azure disk mapping pending` | The run ended before mapping reached this volume | **valid** |
+| `Disk space collection failed: ...` | `df` could not read this volume | not present |
+
+Filter on the prefix, not on `Error == "None"`, if you want every row whose usage is valid.
+Typical reasons for "unavailable": IMDS unreachable, no `/dev/disk/azure` links, LUN not listed in
+IMDS, or a resource / temporary disk (which is not a managed disk, so this is expected for `/mnt`).
 
 ## Error handling
 
 | Condition | Result |
 |---|---|
-| IMDS unreachable / disk not matched | Usage is still reported; Azure columns `null`; `Error` = `None` |
+| IMDS unreachable / disk not matched | Usage is still reported; Azure columns `null`. Windows: `Error` = `None`. Linux: `Error` = `Azure disk mapping unavailable: <reason>` (exit 0, not a failure) |
 | Collector cannot start (bad/missing account, SAS, no curl) | Nothing can be written; message on stderr, exit 1 (visible in the extension status) |
 | No fixed volumes found | One row, RowKey = hostname, `Error` = `No fixed volumes found` |
 | Collection fails | One row, RowKey = hostname, `Error` = `Disk space collection failed: <reason>`, exit 1 |
@@ -236,9 +261,10 @@ into the collector's host-level row.
 - **Linux collector:** run on an Ubuntu VM (OS disk `/`, `/boot/efi`, data disk `/data`).
   That run used an earlier version. Everything since (LUN mapping from Azure udev links only,
   OS-disk detection from `/dev/disk/azure/root`|`os`, all-or-nothing Azure columns, `df` Used for
-  `UsedGB`, PercentFree from raw KiB, error handling) **has not been re-run on a VM yet**. Only
-  the IMDS parser has been exercised, offline, against synthetic responses (whitespace, numeric
-  values, several data disks, no data disks). RHEL/Rocky/Alma (including LVM), SLES, NVMe, md
+  `UsedGB`, PercentFree from raw KiB, error handling, two-phase write) **has not been re-run on a
+  VM yet**. Only the IMDS parser and the write sequence / mapping outcomes have been exercised,
+  offline, with synthetic disks and a stubbed table endpoint (OS + data + temp disk, no links and
+  no IMDS, a volume group spanning OS and data disk, a failing `df`, rejected writes). RHEL/Rocky/Alma (including LVM), SLES, NVMe, md
   RAID and a root volume spanning several disks are untested.
 - **Orchestrator:** written but **not yet run against real VMs** (neither the Windows nor the
   Linux path). The script parses cleanly and the Linux argument quoting was checked locally, but
